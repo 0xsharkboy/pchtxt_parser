@@ -17,6 +17,7 @@ pub struct PchtxtFile {
     pub nsobid: Option<String>,
     pub flags: HashMap<String, String>,
     pub patches: Vec<Patch>,
+    pub is_isp32: bool,
 }
 
 /// Defines possible errors that can occur during parsing.
@@ -26,6 +27,8 @@ pub enum ParseError {
     InvalidAddress(String),
     #[error("Invalid hex value for data: '{0}'")]
     InvalidData(String),
+    #[error("Inconsistent address length in file")]
+    InconsistentAddressLength,
 }
 
 impl PchtxtFile {
@@ -59,6 +62,8 @@ impl PchtxtFile {
     pub fn parse(content: &str) -> Result<Self, ParseError> {
         let mut file = PchtxtFile::default();
         let mut is_in_enabled_section = false;
+        let mut detected_addr_len: Option<usize> = None;
+        let mut address_buffer: Vec<(String, Vec<u8>)> = Vec::new();
 
         for line in content.lines() {
             let trimmed_line = line.split(['#', '/']).next().unwrap_or("").trim();
@@ -95,16 +100,42 @@ impl PchtxtFile {
                     let addr_str = parts[0];
                     let data_str = parts[1];
 
-                    let address = u64::from_str_radix(addr_str, 16)
-                        .map_err(|_| ParseError::InvalidAddress(addr_str.to_string()))?;
+                    // Verify address lenth consistency
+                    let addr_len = addr_str.len();
+                    if addr_len != 6 && addr_len != 8 {
+                        return Err(ParseError::InvalidAddress(addr_str.to_string()));
+                    }
+
+                    if let Some(expected_len) = detected_addr_len {
+                        if expected_len != addr_len {
+                            return Err(ParseError::InconsistentAddressLength);
+                        }
+                    } else {
+                        detected_addr_len = Some(addr_len);
+                    }
 
                     let data = hex_string_to_bytes(data_str)
                         .map_err(|_| ParseError::InvalidData(data_str.to_string()))?;
 
-                    file.patches.push(Patch { address, data });
+                    address_buffer.push((addr_str.to_string(), data));
                 }
             }
         }
+
+        if let Some(addr_len) = detected_addr_len {
+            file.is_isp32 = addr_len == 8;
+            for (mut addr_str, data) in address_buffer {
+                if addr_len == 8 && addr_str.len() == 6 {
+                    addr_str = format!("00{}", addr_str);
+                }
+                let address = u64::from_str_radix(&addr_str, 16)
+                    .map_err(|_| ParseError::InvalidAddress(addr_str.clone()))?;
+                file.patches.push(Patch { address, data });
+            }
+        } else {
+            file.is_isp32 = false;
+        }
+
         Ok(file)
     }
 }
@@ -206,5 +237,28 @@ https://github.com/Fl4sh9174
         let content = "";
         let parsed = PchtxtFile::parse(content).unwrap();
         assert_eq!(parsed, PchtxtFile::default());
+    }
+
+    #[test]
+    fn parses_4_byte_addresses() {
+        let content = "@enabled\n00ABCDEF 11223344\n@stop";
+        let parsed = PchtxtFile::parse(content).unwrap();
+        assert_eq!(parsed.is_isp32, true);
+        assert_eq!(parsed.patches[0].address, 0x00ABCDEF);
+    }
+
+    #[test]
+    fn parses_3_byte_addresses() {
+        let content = "@enabled\nABCDEF 11223344\n@stop";
+        let parsed = PchtxtFile::parse(content).unwrap();
+        assert_eq!(parsed.is_isp32, false);
+        assert_eq!(parsed.patches[0].address, 0x00ABCDEF);
+    }
+
+    #[test]
+    fn error_on_mixed_address_length() {
+        let content = "@enabled\nABCDEF 11223344\n00ABCDEF 55667788\n@stop";
+        let result = PchtxtFile::parse(content);
+        assert_eq!(result, Err(ParseError::InconsistentAddressLength));
     }
 }
